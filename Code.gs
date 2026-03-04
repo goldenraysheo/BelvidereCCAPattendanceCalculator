@@ -347,7 +347,8 @@ function processAttendanceData(actualData, reportType) {
  * Average is rounded up (Math.ceil) to match the original script's behaviour.
  */
 function calculateDailyAverages(actualData, month, reportType) {
-  // siteData[site][dateKey] = { memberId: true, … }
+  // siteData[site][sessionType][dateKey] = { memberId: true, … }
+  // sessionType is 'Before Care', 'After Care', or 'BFY - SO'
   const siteData = {};
   const COL = { date: 0, memberId: 2, program: 4, division: 5 };
 
@@ -369,25 +370,46 @@ function calculateDailyAverages(actualData, month, reportType) {
     if (reportType !== 'Both' && site !== reportType) continue;
 
     const dateKey = Utilities.formatDate(checkIn, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-    if (!siteData[site])           siteData[site] = {};
-    if (!siteData[site][dateKey])  siteData[site][dateKey] = {};
-    siteData[site][dateKey][memberId] = true;
-  }
 
-  const averages = [];
-  for (const site in siteData) {
-    const dateCounts = {};
-    for (const dateKey in siteData[site]) {
-      dateCounts[dateKey] = Object.keys(siteData[site][dateKey]).length;
+    // Bucket by session type: Schools Out always = 'BFY - SO';
+    // otherwise use check-in hour to split Before Care (AM) vs After Care (PM)
+    let sessionType;
+    if (isDivisionFullDay(division)) {
+      sessionType = 'BFY - SO';
+    } else {
+      sessionType = checkIn.getHours() < 12 ? 'Before Care' : 'After Care';
     }
-    const dateKeys = Object.keys(dateCounts);
-    if (!dateKeys.length) continue;
 
-    const sum  = dateKeys.reduce((t, d) => t + dateCounts[d], 0);
-    const avg  = Math.ceil(sum / dateKeys.length);
-    const peak = Math.max(...Object.values(dateCounts));
-    averages.push({ site, month, reportType: site, average: avg, peak });
+    if (!siteData[site])                       siteData[site] = {};
+    if (!siteData[site][sessionType])          siteData[site][sessionType] = {};
+    if (!siteData[site][sessionType][dateKey]) siteData[site][sessionType][dateKey] = {};
+    siteData[site][sessionType][dateKey][memberId] = true;
   }
+
+  const SESSION_ORDER = ['Before Care', 'After Care', 'BFY - SO'];
+  const averages = [];
+
+  for (const site in siteData) {
+    for (const sessionType in siteData[site]) {
+      const dateCounts = {};
+      for (const dateKey in siteData[site][sessionType]) {
+        dateCounts[dateKey] = Object.keys(siteData[site][sessionType][dateKey]).length;
+      }
+      const dateKeys = Object.keys(dateCounts);
+      if (!dateKeys.length) continue;
+
+      const sum  = dateKeys.reduce((t, d) => t + dateCounts[d], 0);
+      const avg  = Math.ceil(sum / dateKeys.length);
+      const peak = Math.max(...Object.values(dateCounts));
+      averages.push({ site, month, sessionType, average: avg, peak });
+    }
+  }
+
+  // Sort: BFY before Pop.Grv., then Before Care → After Care → BFY - SO
+  averages.sort((a, b) => {
+    if (a.site !== b.site) return a.site.localeCompare(b.site);
+    return SESSION_ORDER.indexOf(a.sessionType) - SESSION_ORDER.indexOf(b.sessionType);
+  });
 
   return averages;
 }
@@ -548,7 +570,7 @@ function updateDailyAveragesSheet(ss, month, reportType, averages) {
     sheet = arSheet
       ? ss.insertSheet('Daily Averages', arSheet.getIndex() + 1)
       : ss.insertSheet('Daily Averages');
-    sheet.getRange(4, 1, 1, 5).setValues([['Site', 'Month', 'Report Type', 'Average Attendance', 'Peak Attendance']]);
+    sheet.getRange(4, 1, 1, 5).setValues([['Site', 'Month', 'Session Type', 'Average Attendance', 'Peak Attendance']]);
     applyDailyAveragesFormatting(sheet, 0);
   }
 
@@ -561,14 +583,14 @@ function updateDailyAveragesSheet(ss, month, reportType, averages) {
     : [];
 
   // Remove rows that belong to the month(s) being reprocessed
+  // Row structure: [site(0), month(1), sessionType(2), avg(3), peak(4)]
   const filtered = existingData.filter(row => {
+    const rowSite  = row[0];
     const rowMonth = row[1];
-    const rowSite  = row[2];
-    const isMatch  = rowMonth === month && (
-      rowSite === reportType ||
-      (reportType === 'Both' && (rowSite === 'BFY' || rowSite === 'Pop.Grv.'))
-    );
-    return !isMatch;
+    const siteMatches = reportType === 'Both'
+      ? (rowSite === 'BFY' || rowSite === 'Pop.Grv.')
+      : rowSite === reportType;
+    return !(rowMonth === month && siteMatches);
   });
 
   if (lastRow > 4) {
@@ -577,7 +599,7 @@ function updateDailyAveragesSheet(ss, month, reportType, averages) {
 
   const allRows = filtered.filter(r => r[0]); // drop blank rows
   for (const avg of averages) {
-    allRows.push([avg.site, avg.month, avg.site, avg.average, avg.peak]);
+    allRows.push([avg.site, avg.month, avg.sessionType, avg.average, avg.peak]);
   }
 
   if (allRows.length > 0) {
