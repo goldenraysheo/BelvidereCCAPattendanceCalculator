@@ -328,7 +328,8 @@ function processAttendanceData(actualData, reportType) {
     if (reportType !== 'Both' && site !== reportType) continue;
 
     const fullDay = isDivisionFullDay(division);
-    const dateKey = Utilities.formatDate(checkIn, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const tz      = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    const dateKey = Utilities.formatDate(checkIn, tz, 'yyyy-MM-dd');
     const type    = fullDay ? 'schoolsOut' : 'regular';
 
     if (!attendance[memberId]) attendance[memberId] = { name, sites: {} };
@@ -370,7 +371,9 @@ function calculateDailyAverages(actualData, month, reportType) {
     if (!site) continue;
     if (reportType !== 'Both' && site !== reportType) continue;
 
-    const dateKey = Utilities.formatDate(checkIn, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const tz      = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    const dateKey = Utilities.formatDate(checkIn, tz, 'yyyy-MM-dd');
+    const hour    = parseInt(Utilities.formatDate(checkIn, tz, 'H'), 10);
 
     // Bucket by session type: Schools Out always = 'BFY - SO';
     // otherwise use check-in hour to split Before Care (AM) vs After Care (PM)
@@ -378,7 +381,7 @@ function calculateDailyAverages(actualData, month, reportType) {
     if (isDivisionFullDay(division)) {
       sessionType = 'BFY - SO';
     } else {
-      sessionType = checkIn.getHours() < 12 ? 'Before Care' : 'After Care';
+      sessionType = hour < 12 ? 'Before Care' : 'After Care';
     }
 
     if (!siteData[site])                       siteData[site] = {};
