@@ -1,461 +1,682 @@
 /**
- * Belvidere CCAP Attendance Calculator
+ * Belvidere CCAP Monthly Attendance Processor
+ * Processes monthly attendance data from RecliqueCore Program Check-Ins exports.
+ * Automatically creates monthly tabs, archives raw data, and calculates daily averages.
  *
- * Reads the Program Check-Ins report exported from RecliqueCore and generates
- * monthly attendance summary tabs, one per site per month.
+ * Based on the original Childcare Monthly Attendance Processor structure.
+ * Updated to accept RecliqueCore's row-per-check-in format and adds support
+ * for Schools Out / Full Day (FD) attendance sessions.
  *
- * ── DATA FORMAT ────────────────────────────────────────────────────────────
- *  Rows 1–4 : Report metadata (title, URL, generated date, etc.)
- *  Row 5    : Column headers
- *  Row 6+   : Attendance data
+ * ── HOW TO USE ───────────────────────────────────────────────────────────────
+ *  1. Export the Program Check-Ins report from RecliqueCore (CSV or copy-paste).
+ *  2. Open the "Attendance Report" tab and paste starting at cell A10.
+ *     Headers will land at row 14; data begins at row 15.
+ *  3. Check ONE box: BFY, Pop.Grv., or Both.
+ *  4. Click the "Process Attendance" button (or use Attendance Tools menu).
  *
+ * ── DATA FORMAT (RecliqueCore Program Check-Ins Report) ──────────────────────
  *  Column A (0) : Checked In  – date/time of check-in
  *  Column C (2) : Member ID   – unique child identifier (used for de-duplication)
  *  Column D (3) : Participant – display name ("Last, First")
  *  Column E (4) : Program     – only "School Age Child Care" rows are processed
- *  Column F (5) : Divisions   – determines site assignment (see SITE MAPPING)
+ *  Column F (5) : Divisions   – determines site (see SITE MAPPING below)
  *
- * ── SITE MAPPING ────────────────────────────────────────────────────────────
+ * ── SITE MAPPING ─────────────────────────────────────────────────────────────
  *  Division starts with "North Boone" → Pop.Grv.  (Poplar Grove Elementary)
- *  Division starts with "Belvidere"   → BFY        (Belvidere Family Y)
  *  Division starts with "Schools Out" → BFY, Full Day (FD)
+ *  Division starts with "Belvidere"   → BFY        (Belvidere Family Y)
  *
- *  Schools Out (Full Day) rules:
- *   • Children from any site may attend Schools Out sessions.
- *   • Schools Out totals always appear on the BFY tab only.
- *   • Children listed on a Schools Out row are marked "(FD)" to denote
- *     Full Day care, distinguished from regular Before & After Care.
- *   • If a child has both regular B&A care AND Schools Out attendance
- *     on the same site (e.g., Belvidere School District children), they
- *     appear as TWO rows on that tab: one for B&A care, one "(FD)" row.
+ * ── FULL DAY (FD) ROWS ───────────────────────────────────────────────────────
+ *  "Schools Out" sessions are full-day care. They always appear on the BFY tab.
+ *  A child with both regular B&A care AND Schools Out attendance at the same
+ *  site appears as TWO rows in the monthly summary:
+ *    "Smith, John"      → Before & After Care     (references B3: Eligible Days)
+ *    "Smith, John (FD)" → Schools Out (Full Day)  (references B4: FD Eligible Days)
  *
- * ── DE-DUPLICATION ──────────────────────────────────────────────────────────
- *  A child is counted once per calendar date per site, regardless of how
- *  many check-in rows appear for them that day (e.g., separate before/after
- *  care entries on the same date collapse to a single day attended).
- *
- * ── OUTPUT TABS ─────────────────────────────────────────────────────────────
- *  Named "{Mon} - {Site}"  →  "Feb - BFY",  "Feb - Pop.Grv."
- *  Each tab lists enrolled children, their session type, and days attended,
- *  followed by a summary section with enrollment counts and total day counts.
+ * ── DE-DUPLICATION ───────────────────────────────────────────────────────────
+ *  A child checking in multiple times on the same date at the same site
+ *  (e.g., separate before-care and after-care entries) counts as ONE day.
  */
 
-// ── Configuration ────────────────────────────────────────────────────────────
+// ===========================
+// MENU SETUP
+// ===========================
 
-var CONFIG = {
-  /** Leave blank to use the first sheet; set a name to target a specific sheet. */
-  dataSheetName: '',
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Attendance Tools')
+    .addItem('Process Attendance', 'processAttendance')
+    .addToUi();
+}
 
-  /** Row number (1-based) where column headers appear in the source data. */
-  headerRow: 5,
-
-  /** First row of actual attendance data (1-based). */
-  dataStartRow: 6,
-
-  /** Only rows matching this value in the Program column are processed. */
-  programFilter: 'School Age Child Care',
-
-  /** Zero-based column indices matching the source report layout. */
-  cols: {
-    date:      0,  // A – Checked In (date/time)
-    memberId:  2,  // C – Member ID
-    name:      3,  // D – Participant
-    program:   4,  // E – Program
-    division:  5   // F – Divisions
-  },
-
-  /** Short site identifiers used in tab names. */
-  sites: {
-    BFY:    'BFY',
-    POPGRV: 'Pop.Grv.'
-  },
-
-  months: ['Jan','Feb','Mar','Apr','May','Jun',
-           'Jul','Aug','Sep','Oct','Nov','Dec'],
-
-  /** Hex colors for output tab formatting. */
-  colors: {
-    headerBg:   '#4A86E8',  // Column header background
-    headerFg:   '#FFFFFF',  // Column header text
-    fullDayBg:  '#FFF2CC',  // Light yellow – Schools Out (FD) rows
-    summaryBg:  '#E8F0FE',  // Light blue   – summary section
-    altRowBg:   '#F8F9FA'   // Very light grey – alternate regular rows
+/**
+ * Set up the Attendance Report sheet with checkboxes and formatting.
+ * Run this once to initialize the sheet (or to reset it after accidental edits).
+ */
+function setupAttendanceReportSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName('Attendance Report');
+  if (!sheet) {
+    sheet = ss.insertSheet('Attendance Report', 0);
   }
-};
+  sheet.clear();
+  sheet.clearFormats();
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
+  // Header question label
+  sheet.getRange('A2:D2').merge();
+  const headerCell = sheet.getRange('A2');
+  headerCell.setValue('Which attendance report are you uploading?');
+  headerCell.setFontWeight('bold');
+  headerCell.setFontSize(10);
+  headerCell.setFontFamily('Verdana');
+  headerCell.setVerticalAlignment('middle');
+  headerCell.setHorizontalAlignment('left');
 
-/** Safe prefix check (Apps Script V8 supports startsWith but older runtimes may not). */
-function startsWith_(str, prefix) {
-  return str.length >= prefix.length && str.slice(0, prefix.length) === prefix;
+  // Checkboxes: A3 = BFY, A4 = Pop.Grv., C3 = Both
+  sheet.getRange('A3:A4').insertCheckboxes();
+  sheet.getRange('A3:A4').setHorizontalAlignment('left').setVerticalAlignment('middle');
+  sheet.getRange('C3').insertCheckboxes();
+  sheet.getRange('C3').setHorizontalAlignment('left').setVerticalAlignment('middle');
+
+  // Labels
+  sheet.getRange('B3').setValue('BFY');
+  sheet.getRange('B4').setValue('Pop.Grv.');
+  sheet.getRange('D3').setValue('Both');
+  ['B3:B4', 'D3'].forEach(r => {
+    sheet.getRange(r).setFontSize(9).setFontFamily('Verdana').setVerticalAlignment('middle');
+  });
+
+  // Divider borders (matching original)
+  sheet.getRange('A8:D8').setBorder(null, null, true, null, null, null, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange('D1:D8').setBorder(null, null, null, true, null, null, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+  // Paste-here marker at A10
+  const pasteCell = sheet.getRange('A10');
+  pasteCell.setValue('Paste here');
+  pasteCell.setBackground('#FFFACD');
+  pasteCell.setFontFamily('Verdana');
+  pasteCell.setFontSize(9);
+
+  // Sheet-wide defaults
+  sheet.setHiddenGridlines(true);
+  sheet.getRange('A1:Z100').setFontFamily('Verdana').setFontSize(9).setFontColor('#333333');
+  sheet.autoResizeColumns(1, 4);
+
+  SpreadsheetApp.getActiveSpreadsheet().toast('Attendance Report sheet has been set up!', 'Setup Complete', 3);
 }
 
-/**
- * Map a Divisions value to a site identifier.
- * Returns null for unrecognised divisions (those rows are skipped).
- * NOTE: "Schools Out" is checked before "Belvidere" so that Schools Out
- * sessions that may contain the word "Belvidere" are still flagged as FD.
- */
-function getSite_(division) {
-  if (!division) return null;
-  var d = division.toString().trim();
-  if (startsWith_(d, 'North Boone'))  return CONFIG.sites.POPGRV;
-  if (startsWith_(d, 'Schools Out'))  return CONFIG.sites.BFY;
-  if (startsWith_(d, 'Belvidere'))    return CONFIG.sites.BFY;
-  return null;
-}
+// ===========================
+// MAIN PROCESSING FUNCTION
+// ===========================
 
-/** Returns true when the division represents a Schools Out (Full Day) session. */
-function isFullDay_(division) {
-  if (!division) return false;
-  return startsWith_(division.toString().trim(), 'Schools Out');
-}
-
-/** Format a Date as YYYY-MM-DD for use as a de-duplication key. */
-function toDateKey_(date) {
-  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-}
-
-/** Return the 3-letter month abbreviation for a Date (e.g., "Feb"). */
-function getMonthAbbr_(date) {
-  return CONFIG.months[date.getMonth()];
-}
-
-// ── Main processing ──────────────────────────────────────────────────────────
-
-/**
- * Entry point – run this to process attendance data and generate output tabs.
- * Accessible from the CCAP Attendance menu added by onOpen().
- */
 function processAttendance() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const sheet = ss.getSheetByName('Attendance Report');
 
-  var dataSheet = CONFIG.dataSheetName
-    ? ss.getSheetByName(CONFIG.dataSheetName)
-    : ss.getSheets()[0];
-
-  if (!dataSheet) {
-    SpreadsheetApp.getUi().alert(
-      'Data sheet not found.\n' +
-      'Set CONFIG.dataSheetName to the exact sheet tab name, or leave it blank to use the first sheet.'
-    );
+  if (!sheet) {
+    ui.alert('Error: "Attendance Report" sheet not found.');
     return;
   }
 
-  var allData = dataSheet.getDataRange().getValues();
-  var startIdx = CONFIG.dataStartRow - 1; // convert 1-based row to 0-based array index
+  // Read checkboxes: A3 = BFY, A4 = Pop.Grv., C3 = Both
+  const bfyChecked    = sheet.getRange('A3').getValue();
+  const popGrvChecked = sheet.getRange('A4').getValue();
+  const bothChecked   = sheet.getRange('C3').getValue();
 
-  if (allData.length <= startIdx) {
-    SpreadsheetApp.getUi().alert(
-      'No attendance data found. Expected data to begin at row ' + CONFIG.dataStartRow + '.'
-    );
+  const checkedCount = (bfyChecked ? 1 : 0) + (popGrvChecked ? 1 : 0) + (bothChecked ? 1 : 0);
+
+  if (checkedCount === 0) {
+    ui.alert('No Selection', 'Please select a report type (BFY, Pop.Grv., or Both).', ui.ButtonSet.OK);
+    return;
+  }
+  if (checkedCount > 1) {
+    ui.alert('Multiple Selections', 'Please select only ONE option (BFY, Pop.Grv., or Both).', ui.ButtonSet.OK);
     return;
   }
 
-  /**
-   * Attendance structure:
-   *
-   *  attendance[memberId] = {
-   *    name: 'Last, First',
-   *    sites: {
-   *      'BFY': {
-   *        'Feb 2026': {
-   *          regular:    { 'YYYY-MM-DD': true, … },   // de-duplicated by date
-   *          schoolsOut: { 'YYYY-MM-DD': true, … }
-   *        }
-   *      },
-   *      'Pop.Grv.': { … }
-   *    }
-   *  }
-   */
-  var attendance = {};
-  var cols = CONFIG.cols;
+  let reportType = null;
+  if (bfyChecked)      reportType = 'BFY';
+  else if (popGrvChecked) reportType = 'Pop.Grv.';
+  else if (bothChecked)   reportType = 'Both';
 
-  for (var i = startIdx; i < allData.length; i++) {
-    var row = allData[i];
+  handleReportTypeSelection(reportType);
 
-    // Skip completely empty rows
-    if (!row[cols.date]) continue;
+  // Uncheck all boxes after processing
+  sheet.getRange('A3:A4').uncheck();
+  sheet.getRange('C3').uncheck();
+}
 
-    // Filter: Program column must equal "School Age Child Care"
-    var program = (row[cols.program] || '').toString().trim();
-    if (program !== CONFIG.programFilter) continue;
+// ===========================
+// CORE HANDLER
+// ===========================
 
-    // Parse check-in date
-    var checkIn;
-    if (row[cols.date] instanceof Date) {
-      checkIn = row[cols.date];
-    } else {
-      checkIn = new Date(row[cols.date]);
-    }
-    if (isNaN(checkIn.getTime())) continue;
+function handleReportTypeSelection(reportType) {
+  if (!reportType) return;
 
-    var memberId = (row[cols.memberId] || '').toString().trim();
-    var name     = (row[cols.name]     || '').toString().trim();
-    var division = (row[cols.division] || '').toString().trim();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
 
-    if (!memberId || !name) continue;
+  ss.toast(`Processing ${reportType} attendance report...`, 'Processing', -1);
 
-    var site = getSite_(division);
-    if (!site) continue; // Unrecognised division – skip
-
-    var fullDay  = isFullDay_(division);
-    var dateKey  = toDateKey_(checkIn);
-    var monthKey = getMonthAbbr_(checkIn) + ' ' + checkIn.getFullYear(); // e.g., "Feb 2026"
-    var type     = fullDay ? 'schoolsOut' : 'regular';
-
-    // Initialise nested structure as needed
-    if (!attendance[memberId]) {
-      attendance[memberId] = { name: name, sites: {} };
-    }
-    var A = attendance[memberId];
-    if (!A.sites[site])           A.sites[site] = {};
-    if (!A.sites[site][monthKey]) A.sites[site][monthKey] = { regular: {}, schoolsOut: {} };
-
-    // Store date key – object property assignment acts as a Set (de-duplicates)
-    A.sites[site][monthKey][type][dateKey] = true;
+  const rawSheet = ss.getSheetByName('Attendance Report');
+  if (!rawSheet) {
+    ui.alert('Error: "Attendance Report" sheet not found.');
+    return;
   }
 
-  generateOutputTabs_(ss, attendance);
+  const lastRow = rawSheet.getLastRow();
+  const lastCol = rawSheet.getLastColumn();
 
-  SpreadsheetApp.getUi().alert(
-    'Attendance processing complete!\n' +
-    'Check the new tabs in this spreadsheet.'
+  if (lastRow < 15 || lastCol < 6) {
+    ui.alert('No data found. Please paste the RecliqueCore attendance report starting at cell A10.');
+    return;
+  }
+
+  const allData = rawSheet.getRange(1, 1, lastRow, lastCol).getValues();
+
+  // Find the first row that contains an actual check-in date in column A
+  const dataStartRow = findDataStartRow(allData);
+  if (dataStartRow === -1) {
+    ui.alert('Error: Could not find attendance data. Make sure you pasted the full report starting at A10.');
+    return;
+  }
+
+  // actualData[0] = first check-in event row
+  const actualData = allData.slice(dataStartRow);
+
+  // Detect month from column A of the first check-in row
+  const month = detectMonth(actualData[0]);
+  if (!month) {
+    ui.alert('Error: Could not detect month from data. Ensure the report contains valid check-in dates in column A.');
+    return;
+  }
+
+  // Determine which sites to output
+  const sitesToProcess = reportType === 'Both' ? ['BFY', 'Pop.Grv.'] : [reportType];
+
+  // Process all check-in rows into an attendance map
+  const attendanceMap = processAttendanceData(actualData, reportType);
+
+  // Calculate daily averages per site
+  const dailyAverages = calculateDailyAverages(actualData, month, reportType);
+
+  // Update Daily Averages sheet first (so tab ordering stays correct)
+  updateDailyAveragesSheet(ss, month, reportType, dailyAverages);
+
+  // Create/update one monthly summary tab per site
+  const tabNames = [];
+  for (const site of sitesToProcess) {
+    createOrUpdateMonthlySheet(ss, month, site, attendanceMap);
+    tabNames.push(`${month}-${site}`);
+  }
+
+  // Archive raw check-in data (hidden tab)
+  createOrUpdateArchiveSheet(ss, month, reportType, actualData);
+
+  // Clear the Attendance Report sheet ready for next upload
+  clearAttendanceReportSheet(rawSheet);
+
+  ss.toast('', '', 1);
+
+  const tabList = tabNames.map(t => `"${t}"`).join(' and ');
+  ui.alert(
+    'Success!',
+    `Attendance data for ${month} (${reportType}) has been processed.\n\n` +
+    `• Monthly summary: ${tabList} tab(s)\n` +
+    `• Raw data archived: "${month}-${reportType} Archive" tab (hidden)\n` +
+    `• Daily averages updated\n` +
+    `• Attendance Report cleared and ready for next report`,
+    ui.ButtonSet.OK
   );
 }
 
-// ── Output tab generation ────────────────────────────────────────────────────
+// ===========================
+// HELPER FUNCTIONS
+// ===========================
 
-/** Create or refresh all output tabs derived from the processed attendance map. */
-function generateOutputTabs_(ss, attendance) {
-  // Discover every (monthKey, site) pair present in the data
-  var needed = {}; // tabName → { monthKey, site }
-
-  for (var id in attendance) {
-    var child = attendance[id];
-    for (var site in child.sites) {
-      for (var monthKey in child.sites[site]) {
-        var mon     = monthKey.split(' ')[0];          // "Feb"
-        var tabName = mon + ' - ' + site;              // "Feb - BFY"
-        if (!needed[tabName]) {
-          needed[tabName] = { monthKey: monthKey, site: site };
-        }
-      }
-    }
+/**
+ * Return the 0-based array index of the first row whose column A contains
+ * an actual check-in Date (or date-formatted string).
+ * Metadata rows ("Report Title:", URL, "Generated:", blank) and the column
+ * header row ("Checked In") contain strings, so they are naturally skipped.
+ */
+function findDataStartRow(allData) {
+  for (let r = 0; r < allData.length; r++) {
+    const cell = allData[r][0];
+    if (cell instanceof Date && !isNaN(cell)) return r;
+    // Fallback for string dates like "2/2/2026 5:40"
+    if (typeof cell === 'string' && /^\d{1,2}\/\d{1,2}\/\d{4}/.test(cell)) return r;
   }
-
-  // Sort tabs chronologically then alphabetically by site
-  var tabNames = Object.keys(needed).sort(function(a, b) {
-    var aKey = needed[a].monthKey;
-    var bKey = needed[b].monthKey;
-    // Compare "Mon YYYY" as sortable strings; year comes first for correct order
-    var aSort = aKey.split(' ')[1] + '-' + CONFIG.months.indexOf(aKey.split(' ')[0]);
-    var bSort = bKey.split(' ')[1] + '-' + CONFIG.months.indexOf(bKey.split(' ')[0]);
-    return aSort.localeCompare(bSort) || a.localeCompare(b);
-  });
-
-  for (var t = 0; t < tabNames.length; t++) {
-    var tabName = tabNames[t];
-    var info    = needed[tabName];
-
-    var sheet = ss.getSheetByName(tabName);
-    if (sheet) {
-      sheet.clearContents();
-      sheet.clearFormats();
-    } else {
-      sheet = ss.insertSheet(tabName);
-    }
-
-    populateTab_(sheet, tabName, info.monthKey, info.site, attendance);
-  }
+  return -1;
 }
 
 /**
- * Write attendance data and formatting to a single output tab.
- *
- * Layout (rows):
- *   1  : Title
- *   2  : Subtitle (month | site)
- *   3  : Blank
- *   4  : Column headers
- *   5+ : One row per child / session type
- *   …  : Blank separator
- *   …  : Summary section (4 rows)
+ * Detect month abbreviation ("Jan", "Feb", …) from the check-in date
+ * in column A of the first data row.
  */
-function populateTab_(sheet, tabName, monthKey, site, attendance) {
-  var siteFull = site === CONFIG.sites.BFY
-    ? 'Belvidere Family Y'
-    : 'Poplar Grove Elementary';
+function detectMonth(firstDataRow) {
+  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const cell = firstDataRow[0];
+  if (cell instanceof Date && !isNaN(cell)) return monthNames[cell.getMonth()];
+  if (typeof cell === 'string') {
+    const d = new Date(cell);
+    if (!isNaN(d.getTime())) return monthNames[d.getMonth()];
+  }
+  return null;
+}
 
-  // ── Collect child rows ──────────────────────────────────────────────────
+/**
+ * Map a Divisions value (column F) to a site identifier.
+ * Returns 'BFY', 'Pop.Grv.', or null for unrecognised divisions.
+ * NOTE: "Schools Out" is checked before "Belvidere" so that any Schools Out
+ * session containing the word "Belvidere" is still flagged as Full Day.
+ */
+function getSiteFromDivision(division) {
+  if (!division) return null;
+  const d = division.toString().trim();
+  if (d.startsWith('North Boone')) return 'Pop.Grv.';
+  if (d.startsWith('Schools Out')) return 'BFY';
+  if (d.startsWith('Belvidere'))   return 'BFY';
+  return null;
+}
 
-  var childRows = [];
+/**
+ * Returns true when the division represents a Schools Out (Full Day) session.
+ */
+function isDivisionFullDay(division) {
+  return division ? division.toString().trim().startsWith('Schools Out') : false;
+}
 
-  for (var id in attendance) {
-    var child = attendance[id];
-    if (!child.sites[site] || !child.sites[site][monthKey]) continue;
+/**
+ * Process raw check-in rows into an attendance map.
+ *
+ * De-duplication: same Member ID + same site + same calendar date = 1 day,
+ * regardless of how many check-in rows exist (before-care + after-care on
+ * the same date collapses to a single counted day).
+ *
+ * Returns:
+ *   { memberId: { name, sites: { site: { regular: {dateKey:true}, schoolsOut: {dateKey:true} } } } }
+ */
+function processAttendanceData(actualData, reportType) {
+  const attendance = {};
+  const COL = { date: 0, memberId: 2, name: 3, program: 4, division: 5 };
 
-    var m        = child.sites[site][monthKey];
-    var regCount = Object.keys(m.regular).length;
-    var fdCount  = Object.keys(m.schoolsOut).length;
+  for (const row of actualData) {
+    if (!row[COL.date]) continue;
 
-    // Regular Before & After Care row
+    // Only process "School Age Child Care" rows
+    const program = (row[COL.program] || '').toString().trim();
+    if (program !== 'School Age Child Care') continue;
+
+    const checkIn = row[COL.date] instanceof Date ? row[COL.date] : new Date(row[COL.date]);
+    if (isNaN(checkIn.getTime())) continue;
+
+    const memberId = (row[COL.memberId] || '').toString().trim();
+    const name     = (row[COL.name]     || '').toString().trim();
+    const division = (row[COL.division] || '').toString().trim();
+
+    if (!memberId || !name) continue;
+
+    const site = getSiteFromDivision(division);
+    if (!site) continue;
+
+    // Skip sites that don't match the selected report type
+    if (reportType !== 'Both' && site !== reportType) continue;
+
+    const fullDay = isDivisionFullDay(division);
+    const dateKey = Utilities.formatDate(checkIn, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const type    = fullDay ? 'schoolsOut' : 'regular';
+
+    if (!attendance[memberId]) attendance[memberId] = { name, sites: {} };
+    const A = attendance[memberId];
+    if (!A.sites[site])           A.sites[site] = { regular: {}, schoolsOut: {} };
+
+    // Object-as-set: assigning the same dateKey twice still counts as one day
+    A.sites[site][type][dateKey] = true;
+  }
+
+  return attendance;
+}
+
+/**
+ * Calculate daily average and peak attendance per site.
+ * Counts unique children (by Member ID) who were present on each calendar date.
+ * Average is rounded up (Math.ceil) to match the original script's behaviour.
+ */
+function calculateDailyAverages(actualData, month, reportType) {
+  // siteData[site][dateKey] = { memberId: true, … }
+  const siteData = {};
+  const COL = { date: 0, memberId: 2, program: 4, division: 5 };
+
+  for (const row of actualData) {
+    if (!row[COL.date]) continue;
+
+    const program = (row[COL.program] || '').toString().trim();
+    if (program !== 'School Age Child Care') continue;
+
+    const checkIn = row[COL.date] instanceof Date ? row[COL.date] : new Date(row[COL.date]);
+    if (isNaN(checkIn.getTime())) continue;
+
+    const memberId = (row[COL.memberId] || '').toString().trim();
+    const division = (row[COL.division] || '').toString().trim();
+    if (!memberId) continue;
+
+    const site = getSiteFromDivision(division);
+    if (!site) continue;
+    if (reportType !== 'Both' && site !== reportType) continue;
+
+    const dateKey = Utilities.formatDate(checkIn, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    if (!siteData[site])           siteData[site] = {};
+    if (!siteData[site][dateKey])  siteData[site][dateKey] = {};
+    siteData[site][dateKey][memberId] = true;
+  }
+
+  const averages = [];
+  for (const site in siteData) {
+    const dateCounts = {};
+    for (const dateKey in siteData[site]) {
+      dateCounts[dateKey] = Object.keys(siteData[site][dateKey]).length;
+    }
+    const dateKeys = Object.keys(dateCounts);
+    if (!dateKeys.length) continue;
+
+    const sum  = dateKeys.reduce((t, d) => t + dateCounts[d], 0);
+    const avg  = Math.ceil(sum / dateKeys.length);
+    const peak = Math.max(...Object.values(dateCounts));
+    averages.push({ site, month, reportType: site, average: avg, peak });
+  }
+
+  return averages;
+}
+
+// ===========================
+// SHEET CREATION FUNCTIONS
+// ===========================
+
+/**
+ * Create or update the monthly summary sheet for a single site.
+ *
+ * Layout (matching original, with row 4 added for FD Eligible Days):
+ *   Row 1 : Month: [month] ([site])
+ *   Row 2 : Year:          [yellow input]
+ *   Row 3 : Eligible Days: [yellow input]  ← B&A care
+ *   Row 4 : FD Eligible Days: [yellow input]  ← Schools Out days  (new)
+ *   Row 5 : Column headers
+ *   Row 6+: Child data rows
+ *
+ * Children with both B&A care and Schools Out attendance appear as two rows:
+ *   "Smith, John"      | <days> | Before & After Care    | =IF($B$3>0, B6/$B$3, 0)
+ *   "Smith, John (FD)" | <days> | Schools Out (Full Day) | =IF($B$4>0, B7/$B$4, 0)
+ */
+function createOrUpdateMonthlySheet(ss, month, site, attendanceMap) {
+  const tabName = `${month}-${site}`;
+  let sheet = ss.getSheetByName(tabName);
+  const dailyAvgSheet = ss.getSheetByName('Daily Averages');
+
+  if (!sheet) {
+    sheet = dailyAvgSheet
+      ? ss.insertSheet(tabName, dailyAvgSheet.getIndex() + 1)
+      : ss.insertSheet(tabName);
+  } else {
+    sheet.clear();
+    if (dailyAvgSheet) {
+      sheet.activate();
+      ss.moveActiveSheet(dailyAvgSheet.getIndex() + 1);
+    }
+  }
+
+  // ── Header section (rows 1–4) ───────────────────────────────────────────
+
+  sheet.getRange('A1').setValue('Month:');
+  sheet.getRange('B1').setValue(`${month} (${site})`);
+
+  sheet.getRange('A2').setValue('Year:');
+  sheet.getRange('B2')
+    .setBackground('#FFFACD')
+    .setHorizontalAlignment('left')
+    .setBorder(true, true, true, true, false, false, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+
+  sheet.getRange('A3').setValue('Eligible Days:');
+  sheet.getRange('B3')
+    .setBackground('#FFFACD')
+    .setHorizontalAlignment('left')
+    .setBorder(true, true, true, true, false, false, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+
+  // FD Eligible Days — enter the number of Schools Out days in the month
+  sheet.getRange('A4').setValue('FD Eligible Days:');
+  sheet.getRange('B4')
+    .setBackground('#FFFACD')
+    .setHorizontalAlignment('left')
+    .setBorder(true, true, true, true, false, false, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+
+  sheet.getRange('A1:A4').setFontWeight('bold');
+
+  // ── Column headers (row 5) ──────────────────────────────────────────────
+
+  const headers = ['Last Name, First Name', 'Attended Days', 'Session Type', 'Attend %'];
+  sheet.getRange(5, 1, 1, headers.length).setValues([headers]);
+
+  // ── Build child rows ────────────────────────────────────────────────────
+
+  const childRows = [];
+  for (const memberId in attendanceMap) {
+    const child = attendanceMap[memberId];
+    if (!child.sites[site]) continue;
+
+    const siteData = child.sites[site];
+    const regCount  = Object.keys(siteData.regular).length;
+    const fdCount   = Object.keys(siteData.schoolsOut).length;
+
     if (regCount > 0) {
       childRows.push({
-        display: child.name,
-        type:    'regular',
-        days:    regCount,
-        sortKey: child.name
+        displayName: child.name,
+        days:        regCount,
+        sessionType: 'Before & After Care',
+        type:        'regular',
+        sortKey:     child.name
       });
     }
-
-    // Schools Out (Full Day) row – "(FD)" suffix denotes Full Day care
-    // Children with both types appear as two rows (e.g., Belvidere School District kids)
     if (fdCount > 0) {
+      // "(FD)" suffix denotes Full Day / Schools Out care
       childRows.push({
-        display: child.name + ' (FD)',
-        type:    'schoolsOut',
-        days:    fdCount,
-        sortKey: child.name
+        displayName: `${child.name} (FD)`,
+        days:        fdCount,
+        sessionType: 'Schools Out (Full Day)',
+        type:        'schoolsOut',
+        sortKey:     child.name
       });
     }
   }
 
-  // Sort alphabetically by name; for same child, regular row comes before FD row
-  childRows.sort(function(a, b) {
-    var n = a.sortKey.localeCompare(b.sortKey);
+  // Sort alphabetically; for the same child, regular row comes before FD row
+  childRows.sort((a, b) => {
+    const n = a.sortKey.localeCompare(b.sortKey);
     return n !== 0 ? n : (a.type === 'regular' ? -1 : 1);
   });
 
-  // ── Calculate summary totals ────────────────────────────────────────────
+  // ── Write data rows starting at row 6 ──────────────────────────────────
 
-  var totalReg = 0, totalFD = 0;
-  var uniqueReg = {}, uniqueFD = {}, allUnique = {};
-
-  for (var c = 0; c < childRows.length; c++) {
-    var cr = childRows[c];
-    if (cr.type === 'regular') {
-      totalReg += cr.days;
-      uniqueReg[cr.sortKey] = true;
-    } else {
-      totalFD += cr.days;
-      uniqueFD[cr.sortKey] = true;
-    }
-    allUnique[cr.sortKey] = true;
+  const dataRows = [];
+  for (let i = 0; i < childRows.length; i++) {
+    const cr     = childRows[i];
+    const rowNum = 6 + i;
+    // Regular rows use B3 (Eligible Days); FD rows use B4 (FD Eligible Days)
+    const eligRef       = cr.type === 'regular' ? '$B$3' : '$B$4';
+    const attendFormula = `=IF(${eligRef}>0, B${rowNum}/${eligRef}, 0)`;
+    dataRows.push([cr.displayName, cr.days, cr.sessionType, attendFormula]);
   }
 
-  // ── Build output row array ──────────────────────────────────────────────
-
-  var COLS      = 3;
-  var DATA_ROW  = 5; // 1-based row where child data starts (after 3 header rows + 1 blank)
-  var output    = [];
-
-  // Rows 1–4
-  output.push([tabName + '  \u2014  CCAP Attendance Summary', '', '']);  // 1: Title
-  output.push([monthKey + '   |   ' + siteFull, '', '']);                // 2: Subtitle
-  output.push(['', '', '']);                                              // 3: Blank
-  output.push(['Participant', 'Session Type', 'Days Attended']);          // 4: Headers
-
-  // Rows 5+ : child data
-  for (var i = 0; i < childRows.length; i++) {
-    var r = childRows[i];
-    output.push([
-      r.display,
-      r.type === 'regular' ? 'Before & After Care' : 'Schools Out (Full Day)',
-      r.days
-    ]);
+  if (dataRows.length > 0) {
+    sheet.getRange(6, 1, dataRows.length, 4).setValues(dataRows);
   }
 
-  // Blank separator + summary (4 rows)
-  var SUMMARY_ROW = DATA_ROW + childRows.length + 1; // 1-based, after blank
-
-  output.push(['', '', '']);                          // blank separator
-  output.push(['\u2014 SUMMARY \u2014', '', '']);     // "— SUMMARY —"
-  output.push([
-    'Before & After Care',
-    'Children enrolled: ' + Object.keys(uniqueReg).length,
-    'Total days: ' + totalReg
-  ]);
-  output.push([
-    'Schools Out (Full Day)',
-    'Children enrolled: ' + Object.keys(uniqueFD).length,
-    'Total days: ' + totalFD
-  ]);
-  output.push([
-    'Grand Total',
-    'Children: ' + Object.keys(allUnique).length,
-    'Total days: ' + (totalReg + totalFD)
-  ]);
-
-  // ── Write to sheet ──────────────────────────────────────────────────────
-
-  sheet.getRange(1, 1, output.length, COLS).setValues(output);
-
-  // ── Formatting ──────────────────────────────────────────────────────────
-
-  var colors = CONFIG.colors;
-
-  // Row 1: Title
-  sheet.getRange(1, 1, 1, COLS)
-    .merge()
-    .setFontSize(13)
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
-
-  // Row 2: Subtitle
-  sheet.getRange(2, 1, 1, COLS)
-    .merge()
-    .setFontStyle('italic')
-    .setHorizontalAlignment('center');
-
-  // Row 4: Column headers
-  sheet.getRange(4, 1, 1, COLS)
-    .setFontWeight('bold')
-    .setBackground(colors.headerBg)
-    .setFontColor(colors.headerFg)
-    .setHorizontalAlignment('center');
-
-  // Child data rows – alternating row shading + Full Day highlight
-  for (var j = 0; j < childRows.length; j++) {
-    var rowNum = DATA_ROW + j;
-    var cr2    = childRows[j];
-    if (cr2.type === 'schoolsOut') {
-      // Schools Out (FD) rows – distinct yellow background
-      sheet.getRange(rowNum, 1, 1, COLS).setBackground(colors.fullDayBg);
-    } else if (j % 2 === 1) {
-      // Alternate regular rows with very light grey for readability
-      sheet.getRange(rowNum, 1, 1, COLS).setBackground(colors.altRowBg);
-    }
-  }
-
-  // Days Attended column – right-align numbers
-  if (childRows.length > 0) {
-    sheet.getRange(DATA_ROW, COLS, childRows.length, 1).setHorizontalAlignment('right');
-  }
-
-  // Summary section
-  sheet.getRange(SUMMARY_ROW, 1, 5, COLS)
-    .setFontWeight('bold')
-    .setBackground(colors.summaryBg);
-
-  // Grand Total row – slightly larger font
-  sheet.getRange(SUMMARY_ROW + 4, 1, 1, COLS).setFontSize(11);
-
-  // Column widths
-  sheet.setColumnWidth(1, 230);  // Participant name (inc. " (FD)" suffix)
-  sheet.setColumnWidth(2, 210);  // Session type
-  sheet.setColumnWidth(3, 130);  // Days attended
+  applyMonthlySheetFormatting(sheet, dataRows.length);
+  return sheet;
 }
 
-// ── Custom menu ──────────────────────────────────────────────────────────────
+/**
+ * Create or update archive sheet (hidden).
+ * Stores the raw check-in rows for reference/audit.
+ */
+function createOrUpdateArchiveSheet(ss, month, reportType, rawData) {
+  const archiveName = `${month}-${reportType} Archive`;
+  let sheet = ss.getSheetByName(archiveName);
+  if (!sheet) {
+    sheet = ss.insertSheet(archiveName);
+  } else {
+    sheet.clear();
+  }
+  if (rawData.length > 0) {
+    sheet.getRange(1, 1, rawData.length, rawData[0].length).setValues(rawData);
+  }
+  sheet.hideSheet();
+  return sheet;
+}
 
 /**
- * Adds a "CCAP Attendance" menu to the spreadsheet toolbar when the file is opened.
- * This is an Apps Script trigger – do not rename or remove it.
+ * Update the Daily Averages summary sheet.
+ * Removes any existing rows for the current month + reportType, then appends
+ * the newly calculated averages. Supports re-processing without duplicates.
  */
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('CCAP Attendance')
-    .addItem('Process Attendance Data', 'processAttendance')
-    .addToUi();
+function updateDailyAveragesSheet(ss, month, reportType, averages) {
+  let sheet = ss.getSheetByName('Daily Averages');
+  if (!sheet) {
+    const arSheet = ss.getSheetByName('Attendance Report');
+    sheet = arSheet
+      ? ss.insertSheet('Daily Averages', arSheet.getIndex() + 1)
+      : ss.insertSheet('Daily Averages');
+    sheet.getRange(4, 1, 1, 5).setValues([['Site', 'Month', 'Report Type', 'Average Attendance', 'Peak Attendance']]);
+    applyDailyAveragesFormatting(sheet, 0);
+  }
+
+  const lastRow = Math.max(sheet.getLastRow(), 4);
+  const numCols = Math.max(sheet.getLastColumn(), 5);
+
+  // Read existing data rows (row 5 onwards)
+  const existingData = lastRow > 4
+    ? sheet.getRange(5, 1, lastRow - 4, numCols).getValues()
+    : [];
+
+  // Remove rows that belong to the month(s) being reprocessed
+  const filtered = existingData.filter(row => {
+    const rowMonth = row[1];
+    const rowSite  = row[2];
+    const isMatch  = rowMonth === month && (
+      rowSite === reportType ||
+      (reportType === 'Both' && (rowSite === 'BFY' || rowSite === 'Pop.Grv.'))
+    );
+    return !isMatch;
+  });
+
+  if (lastRow > 4) {
+    sheet.getRange(5, 1, lastRow - 4, numCols).clear();
+  }
+
+  const allRows = filtered.filter(r => r[0]); // drop blank rows
+  for (const avg of averages) {
+    allRows.push([avg.site, avg.month, avg.site, avg.average, avg.peak]);
+  }
+
+  if (allRows.length > 0) {
+    sheet.getRange(5, 1, allRows.length, 5).setValues(allRows);
+  }
+
+  applyDailyAveragesFormatting(sheet, allRows.length);
+  return sheet;
+}
+
+/**
+ * Clear pasted attendance data from the Attendance Report sheet
+ * (rows 10 onwards), restore the "Paste here" marker, and uncheck all boxes.
+ */
+function clearAttendanceReportSheet(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow >= 10) {
+    sheet.getRange(10, 1, lastRow - 9, lastCol).clear();
+  }
+  const pasteCell = sheet.getRange('A10');
+  pasteCell.setValue('Paste here');
+  pasteCell.setBackground('#FFFACD');
+  pasteCell.setFontFamily('Verdana');
+  pasteCell.setFontSize(9);
+  sheet.getRange('A3:A4').uncheck();
+  sheet.getRange('C3').uncheck();
+}
+
+// ===========================
+// FORMATTING FUNCTIONS
+// ===========================
+
+/**
+ * Apply formatting to a monthly summary sheet.
+ * Matches the original script's style exactly.
+ */
+function applyMonthlySheetFormatting(sheet, dataRowCount) {
+  sheet.setHiddenGridlines(true);
+  sheet.getRange('A1:Z1000').setFontFamily('Verdana').setFontSize(9).setFontColor('#333333');
+
+  const headerRange = sheet.getRange(5, 1, 1, 4);
+  headerRange.setFontWeight('bold');
+  headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+  if (dataRowCount > 0) {
+    // Attend % as percentage
+    sheet.getRange(6, 4, dataRowCount, 1).setNumberFormat('0%');
+
+    // Centre "Attended Days" column
+    sheet.getRange(6, 2, dataRowCount, 1).setHorizontalAlignment('center');
+
+    // Borders around data area
+    const dataRange = sheet.getRange(5, 1, dataRowCount + 1, 4);
+    dataRange.setBorder(true, true, true, true, false, false, '#666666', SpreadsheetApp.BorderStyle.SOLID);
+    dataRange.setBorder(null, null, null, null, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+    // Re-apply medium bottom border on header row
+    headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+    // Conditional formatting: attend % < 70% → light red background
+    const attendRange = sheet.getRange(6, 4, dataRowCount, 1);
+    const rule = SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberLessThan(0.70)
+      .setBackground('#FFE5E5')
+      .setRanges([attendRange])
+      .build();
+    const rules = sheet.getConditionalFormatRules();
+    rules.push(rule);
+    sheet.setConditionalFormatRules(rules);
+
+    // Filter on header row
+    const existing = sheet.getFilter();
+    if (existing) existing.remove();
+    sheet.getRange(5, 1, dataRowCount + 1, 4).createFilter();
+  }
+
+  sheet.autoResizeColumns(1, 4);
+}
+
+/**
+ * Apply formatting to the Daily Averages sheet.
+ * Matches the original script's style exactly.
+ */
+function applyDailyAveragesFormatting(sheet, dataRowCount) {
+  sheet.setHiddenGridlines(true);
+  sheet.getRange('A1:Z1000').setFontFamily('Verdana').setFontSize(9).setFontColor('#333333');
+
+  const headerRange = sheet.getRange(4, 1, 1, 5);
+  headerRange.setFontWeight('bold');
+  headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+  if (dataRowCount > 0) {
+    const dataRange = sheet.getRange(4, 1, dataRowCount + 1, 5);
+    dataRange.setBorder(true, true, true, true, false, false, '#666666', SpreadsheetApp.BorderStyle.SOLID);
+    dataRange.setBorder(null, null, null, null, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+    headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+    const existing = sheet.getFilter();
+    if (existing) existing.remove();
+    sheet.getRange(4, 1, dataRowCount + 1, 5).createFilter();
+  }
+
+  sheet.autoResizeColumns(1, 5);
 }
