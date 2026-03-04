@@ -213,8 +213,9 @@ function handleReportTypeSelection(reportType) {
     tabNames.push(`${month}-${site}`);
   }
 
-  // Archive raw check-in data (hidden tab)
-  createOrUpdateArchiveSheet(ss, month, reportType, actualData);
+  // Archive raw check-in data (hidden tab), including the source header row
+  const headerRow = dataStartRow > 0 ? allData[dataStartRow - 1] : null;
+  createOrUpdateArchiveSheet(ss, month, reportType, headerRow, actualData);
 
   // Clear the Attendance Report sheet ready for next upload
   clearAttendanceReportSheet(rawSheet);
@@ -450,7 +451,7 @@ function createOrUpdateMonthlySheet(ss, month, site, attendanceMap) {
     }
   }
 
-  // ── Header section (rows 1–4) ───────────────────────────────────────────
+  // ── Header section (rows 1–3) ───────────────────────────────────────────
 
   sheet.getRange('A1').setValue('Month:');
   sheet.getRange('B1').setValue(`${month} (${site})`);
@@ -467,19 +468,12 @@ function createOrUpdateMonthlySheet(ss, month, site, attendanceMap) {
     .setHorizontalAlignment('left')
     .setBorder(true, true, true, true, false, false, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
 
-  // FD Eligible Days — enter the number of Schools Out days in the month
-  sheet.getRange('A4').setValue('FD Eligible Days:');
-  sheet.getRange('B4')
-    .setBackground('#FFFACD')
-    .setHorizontalAlignment('left')
-    .setBorder(true, true, true, true, false, false, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
+  sheet.getRange('A1:A3').setFontWeight('bold');
 
-  sheet.getRange('A1:A4').setFontWeight('bold');
-
-  // ── Column headers (row 5) ──────────────────────────────────────────────
+  // ── Column headers (row 4) ──────────────────────────────────────────────
 
   const headers = ['Last Name, First Name', 'Attended Days', 'Session Type', 'Attend %'];
-  sheet.getRange(5, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(4, 1, 1, headers.length).setValues([headers]);
 
   // ── Build child rows ────────────────────────────────────────────────────
 
@@ -523,16 +517,14 @@ function createOrUpdateMonthlySheet(ss, month, site, attendanceMap) {
 
   const dataRows = [];
   for (let i = 0; i < childRows.length; i++) {
-    const cr     = childRows[i];
-    const rowNum = 6 + i;
-    // Regular rows use B3 (Eligible Days); FD rows use B4 (FD Eligible Days)
-    const eligRef       = cr.type === 'regular' ? '$B$3' : '$B$4';
-    const attendFormula = `=IF(${eligRef}>0, B${rowNum}/${eligRef}, 0)`;
+    const cr            = childRows[i];
+    const rowNum        = 5 + i;
+    const attendFormula = `=IF($B$3>0, B${rowNum}/$B$3, 0)`;
     dataRows.push([cr.displayName, cr.days, cr.sessionType, attendFormula]);
   }
 
   if (dataRows.length > 0) {
-    sheet.getRange(6, 1, dataRows.length, 4).setValues(dataRows);
+    sheet.getRange(5, 1, dataRows.length, 4).setValues(dataRows);
   }
 
   applyMonthlySheetFormatting(sheet, dataRows.length);
@@ -543,7 +535,7 @@ function createOrUpdateMonthlySheet(ss, month, site, attendanceMap) {
  * Create or update archive sheet (hidden).
  * Stores the raw check-in rows for reference/audit.
  */
-function createOrUpdateArchiveSheet(ss, month, reportType, rawData) {
+function createOrUpdateArchiveSheet(ss, month, reportType, headerRow, rawData) {
   const archiveName = `${month}-${reportType} Archive`;
   let sheet = ss.getSheetByName(archiveName);
   if (!sheet) {
@@ -551,8 +543,37 @@ function createOrUpdateArchiveSheet(ss, month, reportType, rawData) {
   } else {
     sheet.clear();
   }
-  if (rawData.length > 0) {
-    sheet.getRange(1, 1, rawData.length, rawData[0].length).setValues(rawData);
+
+  const tz = Session.getScriptTimeZone();
+  const archiveRows = [];
+
+  // Write original column headers with a new "Check-in Time" column appended
+  if (headerRow) {
+    archiveRows.push([...headerRow, 'Check-in Time']);
+  }
+
+  // For each data row: keep col A as date-only string, append time as "HH:mm"
+  for (const row of rawData) {
+    const newRow = [...row];
+    const cell = newRow[0];
+    let timeStr = '';
+    if (cell instanceof Date && !isNaN(cell)) {
+      timeStr = Utilities.formatDate(cell, tz, 'HH:mm');
+      newRow[0] = Utilities.formatDate(cell, tz, 'M/d/yyyy');
+    } else if (typeof cell === 'string' && cell) {
+      const d = new Date(cell);
+      if (!isNaN(d.getTime())) {
+        timeStr = Utilities.formatDate(d, tz, 'HH:mm');
+        newRow[0] = Utilities.formatDate(d, tz, 'M/d/yyyy');
+      }
+    }
+    newRow.push(timeStr);
+    archiveRows.push(newRow);
+  }
+
+  if (archiveRows.length > 0) {
+    const numCols = archiveRows[0].length;
+    sheet.getRange(1, 1, archiveRows.length, numCols).setValues(archiveRows);
   }
   sheet.hideSheet();
   return sheet;
@@ -641,26 +662,26 @@ function applyMonthlySheetFormatting(sheet, dataRowCount) {
   sheet.setHiddenGridlines(true);
   sheet.getRange('A1:Z1000').setFontFamily('Verdana').setFontSize(9).setFontColor('#333333');
 
-  const headerRange = sheet.getRange(5, 1, 1, 4);
+  const headerRange = sheet.getRange(4, 1, 1, 4);
   headerRange.setFontWeight('bold');
   headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
 
   if (dataRowCount > 0) {
     // Attend % as percentage
-    sheet.getRange(6, 4, dataRowCount, 1).setNumberFormat('0%');
+    sheet.getRange(5, 4, dataRowCount, 1).setNumberFormat('0%');
 
     // Centre "Attended Days" column
-    sheet.getRange(6, 2, dataRowCount, 1).setHorizontalAlignment('center');
+    sheet.getRange(5, 2, dataRowCount, 1).setHorizontalAlignment('center');
 
     // Borders around data area
-    const dataRange = sheet.getRange(5, 1, dataRowCount + 1, 4);
+    const dataRange = sheet.getRange(4, 1, dataRowCount + 1, 4);
     dataRange.setBorder(true, true, true, true, false, false, '#666666', SpreadsheetApp.BorderStyle.SOLID);
     dataRange.setBorder(null, null, null, null, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.DOTTED);
     // Re-apply medium bottom border on header row
     headerRange.setBorder(null, null, true, null, null, null, '#666666', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
 
     // Conditional formatting: attend % < 70% → light red background
-    const attendRange = sheet.getRange(6, 4, dataRowCount, 1);
+    const attendRange = sheet.getRange(5, 4, dataRowCount, 1);
     const rule = SpreadsheetApp.newConditionalFormatRule()
       .whenNumberLessThan(0.70)
       .setBackground('#FFE5E5')
@@ -673,7 +694,7 @@ function applyMonthlySheetFormatting(sheet, dataRowCount) {
     // Filter on header row
     const existing = sheet.getFilter();
     if (existing) existing.remove();
-    sheet.getRange(5, 1, dataRowCount + 1, 4).createFilter();
+    sheet.getRange(4, 1, dataRowCount + 1, 4).createFilter();
   }
 
   sheet.autoResizeColumns(1, 4);
