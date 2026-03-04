@@ -72,17 +72,19 @@ function setupAttendanceReportSheet() {
   headerCell.setVerticalAlignment('middle');
   headerCell.setHorizontalAlignment('left');
 
-  // Checkboxes: A3 = BFY, A4 = Pop.Grv., C3 = Both
-  sheet.getRange('A3:A4').insertCheckboxes();
-  sheet.getRange('A3:A4').setHorizontalAlignment('left').setVerticalAlignment('middle');
+  // Checkboxes: A3 = BFY, C3 = Pop.Grv., A4 = Both
+  sheet.getRange('A3').insertCheckboxes();
   sheet.getRange('C3').insertCheckboxes();
-  sheet.getRange('C3').setHorizontalAlignment('left').setVerticalAlignment('middle');
+  sheet.getRange('A4').insertCheckboxes();
+  ['A3', 'C3', 'A4'].forEach(r => {
+    sheet.getRange(r).setHorizontalAlignment('left').setVerticalAlignment('middle');
+  });
 
   // Labels
   sheet.getRange('B3').setValue('BFY');
-  sheet.getRange('B4').setValue('Pop.Grv.');
-  sheet.getRange('D3').setValue('Both');
-  ['B3:B4', 'D3'].forEach(r => {
+  sheet.getRange('D3').setValue('Pop.Grv.');
+  sheet.getRange('B4').setValue('Both');
+  ['B3', 'D3', 'B4'].forEach(r => {
     sheet.getRange(r).setFontSize(9).setFontFamily('Verdana').setVerticalAlignment('middle');
   });
 
@@ -119,10 +121,10 @@ function processAttendance() {
     return;
   }
 
-  // Read checkboxes: A3 = BFY, A4 = Pop.Grv., C3 = Both
+  // Read checkboxes: A3 = BFY, C3 = Pop.Grv., A4 = Both
   const bfyChecked    = sheet.getRange('A3').getValue();
-  const popGrvChecked = sheet.getRange('A4').getValue();
-  const bothChecked   = sheet.getRange('C3').getValue();
+  const popGrvChecked = sheet.getRange('C3').getValue();
+  const bothChecked   = sheet.getRange('A4').getValue();
 
   const checkedCount = (bfyChecked ? 1 : 0) + (popGrvChecked ? 1 : 0) + (bothChecked ? 1 : 0);
 
